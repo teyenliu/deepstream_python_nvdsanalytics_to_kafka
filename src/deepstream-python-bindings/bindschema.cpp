@@ -419,12 +419,19 @@ namespace pydeepstream {
                 .def_property("otherAttrs",
                               STRING_PROPERTY(NvDsEventMsgMeta, otherAttrs))
                 .def_property("videoPath",
-                              STRING_PROPERTY(NvDsEventMsgMeta, videoPath))
+                              STRING_PROPERTY(NvDsEventMsgMeta, videoPath))                              
                 .def_readwrite("extMsg", &NvDsEventMsgMeta::extMsg)
                 .def_readwrite("extMsgSize", &NvDsEventMsgMeta::extMsgSize)
                 
                 .def_readwrite("lc_curr_straight", &NvDsEventMsgMeta::lc_curr_straight)
-                .def_readwrite("lc_cum_straight", &NvDsEventMsgMeta::lc_cum_straight);
+                .def_readwrite("lc_cum_straight", &NvDsEventMsgMeta::lc_cum_straight)
+
+                /* Danny Modification */
+                .def_readwrite("imgWidth", &NvDsEventMsgMeta::imgWidth)
+                .def_readwrite("imgHeight", &NvDsEventMsgMeta::imgHeight)
+                .def_readwrite("imgChannel", &NvDsEventMsgMeta::imgChannel)
+                .def_property("imgBlob",
+                              STRING_PROPERTY(NvDsEventMsgMeta, imgBlob));
 
         m.def("alloc_nvds_event_msg_meta",
               []() {

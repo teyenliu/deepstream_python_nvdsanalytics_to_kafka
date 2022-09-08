@@ -17,7 +17,7 @@
 # limitations under the License.
 ################################################################################
 
-import sys
+import sys, os
 import gi
 import configparser
 gi.require_version("Gst", "1.0")
@@ -28,6 +28,33 @@ from common.is_aarch_64 import is_aarch64
 from common.bus_call import bus_call
 from common.utils import long_to_uint64
 import pyds
+import numpy as np
+import cv2
+import shutil
+
+from PIL import Image
+import numpy as np
+import json
+import base64
+
+RESIZE_WIDTH = 480
+RESIZE_HEIGHT = 360
+
+img_path = "./predict_car.png"
+ori_img_PIL = Image.open(img_path)
+img_PIL = ori_img_PIL.resize((RESIZE_WIDTH, RESIZE_HEIGHT))
+img_ndarr = np.array(img_PIL)
+h, w, c = img_ndarr.shape
+img_blob = img_ndarr.tobytes()
+imgBlobStr = base64.b64encode(img_blob).decode()
+
+frame_count={}
+saved_count={}
+
+shutil.rmtree('./retimages')
+os.mkdir("./retimages")
+frame_count["stream_0"]=0
+saved_count["stream_0"]=0
 
 MAX_DISPLAY_LEN = 64
 MAX_TIME_STAMP_LEN = 32
@@ -41,7 +68,7 @@ MUXER_BATCH_TIMEOUT_USEC = 4000000
 input_file = None
 schema_type = 0
 proto_lib = None
-conn_str = "localhost;2181;testTopic"
+conn_str = "140.96.113.140;9091;testTopic"
 cfg_file = None
 topic = None
 no_display = False
@@ -96,15 +123,25 @@ def meta_free_func(data, user_data):
         srcmeta.objSignature.size = 0
 
 
-
-
 def generate_event_msg_meta(data):
     meta = pyds.NvDsEventMsgMeta.cast(data)
     meta.ts = pyds.alloc_buffer(MAX_TIME_STAMP_LEN + 1)
     pyds.generate_ts_rfc3339(meta.ts, MAX_TIME_STAMP_LEN)
 
-
     return meta
+
+def draw_bounding_boxes(image,obj_meta,confidence):
+    confidence='{0:.2f}'.format(confidence)
+    rect_params=obj_meta.rect_params
+    top=int(rect_params.top)
+    left=int(rect_params.left)
+    width=int(rect_params.width)
+    height=int(rect_params.height)
+    obj_name=pgie_classes_str[obj_meta.class_id]
+    image=cv2.rectangle(image,(left,top),(left+width,top+height),(0,0,255,0),2)
+    # Note that on some systems cv2.putText erroneously draws horizontal lines across the image
+    image=cv2.putText(image,obj_name+',C='+str(confidence),(left-10,top-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255,0),2)
+    return image
 
 
 # osd_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
@@ -193,7 +230,13 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                         msg_meta.sensorStr = "device_test"
 
                         if obj_lc_curr_cnt.get("straight"):  msg_meta.lc_curr_straight = obj_lc_curr_cnt["straight"]
-                        if obj_lc_cum_cnt.get("straight") :  msg_meta.lc_cum_straight = obj_lc_cum_cnt["straight"] 
+                        if obj_lc_cum_cnt.get("straight") :  msg_meta.lc_cum_straight = obj_lc_cum_cnt["straight"]
+                        
+                        # Danny Modification
+                        msg_meta.imgWidth = 480
+                        msg_meta.imgHeight = 360
+                        msg_meta.imgChannel = 3
+                        msg_meta.imgBlob = imgBlobStr
 
                         msg_meta = generate_event_msg_meta(msg_meta)
                         user_event_meta = pyds.nvds_acquire_user_meta_from_pool(
@@ -227,6 +270,83 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         except StopIteration:
             break
 
+
+    return Gst.PadProbeReturn.OK
+
+
+# tiler_sink_pad_buffer_probe  will extract metadata received on tiler sink pad
+# and update params for drawing rectangle, object information etc.
+def tiler_sink_pad_buffer_probe(pad,info,u_data):
+    frame_number=0
+    num_rects=0
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        print("Unable to get GstBuffer ")
+        return
+        
+    # Retrieve batch metadata from the gst_buffer
+    # Note that pyds.gst_buffer_get_nvds_batch_meta() expects the
+    # C address of gst_buffer as input, which is obtained with hash(gst_buffer)
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
+            # The casting is done by pyds.NvDsFrameMeta.cast()
+            # The casting also keeps ownership of the underlying memory
+            # in the C code, so the Python garbage collector will leave
+            # it alone.
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        frame_number=frame_meta.frame_num
+        l_obj=frame_meta.obj_meta_list
+        num_rects = frame_meta.num_obj_meta
+        is_first_obj = True
+        save_image = False
+        obj_counter = {
+        PGIE_CLASS_ID_VEHICLE:0,
+        PGIE_CLASS_ID_PERSON:0,
+        PGIE_CLASS_ID_BICYCLE:0,
+        PGIE_CLASS_ID_ROADSIGN:0
+        }
+        while l_obj is not None:
+            try: 
+                # Casting l_obj.data to pyds.NvDsObjectMeta
+                obj_meta=pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+            obj_counter[obj_meta.class_id] += 1
+            # Periodically check for objects with borderline confidence value that may be false positive detections.
+            # If such detections are found, annoate the frame with bboxes and confidence value.
+            # Save the annotated frame to file.
+            if((saved_count["stream_"+str(frame_meta.pad_index)]%30==0) and (obj_meta.confidence>0.3 and obj_meta.confidence<0.31)):
+                if is_first_obj:
+                    is_first_obj = False
+                    # Getting Image data using nvbufsurface
+                    # the input should be address of buffer and batch_id
+                    n_frame=pyds.get_nvds_buf_surface(hash(gst_buffer),frame_meta.batch_id)
+                    #convert python array into numy array format.
+                    frame_image=np.array(n_frame,copy=True,order='C')
+                    #covert the array into cv2 default color format
+                    frame_image=cv2.cvtColor(frame_image,cv2.COLOR_RGBA2BGRA)    
+                save_image = True
+                frame_image=draw_bounding_boxes(frame_image,obj_meta,obj_meta.confidence)
+            try: 
+                l_obj=l_obj.next
+            except StopIteration:
+                break
+
+        print("Frame Number=", frame_number, "Number of Objects=",num_rects,"Vehicle_count=",obj_counter[PGIE_CLASS_ID_VEHICLE],"Person_count=",obj_counter[PGIE_CLASS_ID_PERSON])
+        if save_image:
+            cv2.imwrite("retimages/stream_"+str(frame_meta.pad_index)+"_frame_"+str(frame_number)+".jpg",frame_image)
+        #saved_count["stream_"+str(frame_meta.pad_index)]+=1        
+        try:
+            l_frame=l_frame.next
+        except StopIteration:
+            break
 
     return Gst.PadProbeReturn.OK
 
@@ -269,6 +389,26 @@ def main(args):
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
     if not pgie:
         sys.stderr.write(" Unable to create pgie \n")
+
+
+    ## Danny Modification
+    # Add nvvidconv1 and filter1 to convert the frames to RGBA
+    # which is easier to work with in Python.
+    print("Creating nvvidconv1 \n ")
+    nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
+    if not nvvidconv1:
+        sys.stderr.write(" Unable to create nvvidconv1 \n")
+    print("Creating filter1 \n ")
+    caps1 = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+    filter1 = Gst.ElementFactory.make("capsfilter", "filter1")
+    if not filter1:
+        sys.stderr.write(" Unable to get the caps filter1 \n")
+    filter1.set_property("caps", caps1)
+    print("Creating tiler \n ")
+    tiler=Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+    if not tiler:
+        sys.stderr.write(" Unable to create tiler \n")
+
 
     ## add tracker and nvdsanalytics
     print("Creating nvtracker \n ")
@@ -378,6 +518,15 @@ def main(args):
     if topic is not None:
         msgbroker.set_property("topic", topic)
     msgbroker.set_property("sync", False)
+    
+    if not is_aarch64():
+        # Use CUDA unified memory in the pipeline so frames
+        # can be easily accessed on CPU in Python.
+        mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
+        streammux.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv1.set_property("nvbuf-memory-type", mem_type)
+        tiler.set_property("nvbuf-memory-type", mem_type)
 
     print("Adding elements to Pipeline \n")
     pipeline.add(source)
@@ -388,6 +537,10 @@ def main(args):
     
     pipeline.add(tracker)
     pipeline.add(nvanalytics)
+    
+    pipeline.add(tiler)
+    pipeline.add(nvvidconv1)
+    pipeline.add(filter1)
     
     pipeline.add(nvvidconv)
     pipeline.add(nvosd)
@@ -416,7 +569,11 @@ def main(args):
     # pgie.link(nvvidconv)
     pgie.link(tracker)
     tracker.link(nvanalytics)
-    nvanalytics.link(nvvidconv)
+    
+    nvanalytics.link(nvvidconv1)
+    nvvidconv1.link(filter1)
+    filter1.link(tiler)
+    tiler.link(nvvidconv)
     
     nvvidconv.link(nvosd)
     nvosd.link(tee)
@@ -447,11 +604,15 @@ def main(args):
     #     sys.stderr.write(" Unable to get sink pad of nvosd \n")
 
 
-
     # custom insert  
     nvanalytics_src_pad=nvanalytics.get_static_pad("src")
     nvanalytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, 0)
 
+    tiler_sink_pad=tiler.get_static_pad("sink")
+    if not tiler_sink_pad:
+        sys.stderr.write(" Unable to get src pad \n")
+    else:
+        tiler_sink_pad.add_probe(Gst.PadProbeType.BUFFER, tiler_sink_pad_buffer_probe, 0)
 
 
 

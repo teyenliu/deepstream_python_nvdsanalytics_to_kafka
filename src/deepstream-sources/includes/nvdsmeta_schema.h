@@ -279,6 +279,13 @@ typedef struct NvDsEventMsgMeta {
 
   guint lc_curr_straight;
   guint lc_cum_straight;
+
+  /* Danny Modification */
+  guint imgWidth;
+  guint imgHeight;
+  guint imgChannel;
+  gchar *imgBlob;
+  
 } NvDsEventMsgMeta;
 
 /**
